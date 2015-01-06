@@ -68,6 +68,9 @@ MODULE_VERSION(cuse4bsd, 1);
 FEATURE(cuse4bsd, "Userspace character devices");
 #endif
 
+#define PROC_LOCK(s)
+#define PROC_UNLOCK(s)
+
 struct cuse_command;
 struct cuse_server;
 struct cuse_client;
@@ -269,12 +272,12 @@ cuse_kern_uninit(void *arg)
 SYSUNINIT(cuse_kern_uninit, SI_SUB_VFS /* XXX */, SI_ORDER_ANY, cuse_kern_uninit, 0);
 
 static int
-cuse_server_get(struct cuse_server **ppcs)
+cuse_server_get(struct file *fp, struct cuse_server **ppcs)
 {
 	struct cuse_server *pcs;
 	int error;
 
-	error = devfs_get_cdevpriv((void **)&pcs);
+	error = devfs_get_cdevpriv(fp, (void **)&pcs);
 	if (error != 0) {
 		*ppcs = NULL;
 		return (error);
@@ -453,13 +456,13 @@ cuse_server_alloc_memory(struct cuse_server *pcs,
 }
 
 static int
-cuse_client_get(struct cuse_client **ppcc)
+cuse_client_get(struct file *fp, struct cuse_client **ppcc)
 {
 	struct cuse_client *pcc;
 	int error;
 
 	/* try to get private data */
-	error = devfs_get_cdevpriv((void **)&pcc);
+	error = devfs_get_cdevpriv(fp, (void **)&pcc);
 	if (error != 0) {
 		*ppcc = NULL;
 		return (error);
@@ -547,6 +550,11 @@ cuse_client_got_signal(struct cuse_client_command *pccmd)
 		TAILQ_INSERT_TAIL(&pcs->head, pccmd, entry);
 		cv_signal(&pcs->cv);
 	}
+}
+
+// TODO
+static int proc_rwmem(struct proc *p, struct uio *uio) {
+	return 0;
 }
 
 static int
@@ -655,12 +663,16 @@ cuse_server_free(void *arg)
 
 	cuse_server_free_memory(pcs);
 
+#ifdef TODO
 	knlist_clear(&pcs->selinfo.ki_note, 1);
 	knlist_destroy(&pcs->selinfo.ki_note);
+#endif
 
 	cuse_unlock();
 
+#ifdef TODO
 	seldrain(&pcs->selinfo);
+#endif
 
 	cv_destroy(&pcs->cv);
 
@@ -668,15 +680,16 @@ cuse_server_free(void *arg)
 }
 
 static int
-cuse_server_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
+cuse_server_open(struct dev_open_args *ap)
 {
+	struct file *fp = ap->a_fp;
 	struct cuse_server *pcs;
 
 	pcs = kmalloc(sizeof(*pcs), M_CUSE4BSD, M_WAITOK | M_ZERO);
 	if (pcs == NULL)
 		return (ENOMEM);
 
-	if (devfs_set_cdevpriv(pcs, &cuse_server_free)) {
+	if (devfs_set_cdevpriv(fp, pcs, &cuse_server_free)) {
 		kprintf("Cuse4BSD: Cannot set cdevpriv.\n");
 		kfree(pcs, M_CUSE4BSD);
 		return (ENOMEM);
@@ -696,18 +709,21 @@ cuse_server_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
 }
 
 static int
-cuse_server_close(struct cdev *dev, int fflag, int devtype, struct thread *td)
+cuse_server_close(struct dev_close_args *ap)
 {
+	struct file *fp = ap->a_fp;
 	struct cuse_server *pcs;
 	int error;
 
-	error = cuse_server_get(&pcs);
+	error = cuse_server_get(fp, &pcs);
 	if (error != 0)
 		goto done;
 
 	cuse_lock();
 	cuse_server_is_closing(pcs);
+#ifdef TODO
 	knlist_clear(&pcs->selinfo.ki_note, 1);
+#endif
 	cuse_unlock();
 
 done:
@@ -715,13 +731,13 @@ done:
 }
 
 static int
-cuse_server_read(struct cdev *dev, struct uio *uio, int ioflag)
+cuse_server_read(struct dev_read_args *ap)
 {
 	return (ENXIO);
 }
 
 static int
-cuse_server_write(struct cdev *dev, struct uio *uio, int ioflag)
+cuse_server_write(struct dev_write_args *ap)
 {
 	return (ENXIO);
 }
@@ -805,13 +821,13 @@ cuse_proc2proc_copy(struct proc *proc_s, vm_offset_t data_s,
 		};
 
 		PROC_LOCK(proc_s);
-		_PHOLD(proc_s);
+		PHOLD(proc_s);
 		PROC_UNLOCK(proc_s);
 
 		error = proc_rwmem(proc_s, &uio);
 
 		PROC_LOCK(proc_s);
-		_PRELE(proc_s);
+		PRELE(proc_s);
 		PROC_UNLOCK(proc_s);
 
 	} else if (proc_cur == proc_s) {
@@ -830,13 +846,13 @@ cuse_proc2proc_copy(struct proc *proc_s, vm_offset_t data_s,
 		};
 
 		PROC_LOCK(proc_d);
-		_PHOLD(proc_d);
+		PHOLD(proc_d);
 		PROC_UNLOCK(proc_d);
 
 		error = proc_rwmem(proc_d, &uio);
 
 		PROC_LOCK(proc_d);
-		_PRELE(proc_d);
+		PRELE(proc_d);
 		PROC_UNLOCK(proc_d);
 	} else {
 		error = EINVAL;
@@ -919,8 +935,10 @@ cuse_alloc_unit_by_id_locked(struct cuse_server *pcs, int id)
 static void
 cuse_server_wakeup_locked(struct cuse_server *pcs)
 {
+#ifdef TODO
 	selwakeup(&pcs->selinfo);
 	KNOTE_LOCKED(&pcs->selinfo.ki_note, 0);
+#endif
 }
 
 static int
@@ -943,13 +961,16 @@ cuse_free_unit_by_id_locked(struct cuse_server *pcs, int id)
 }
 
 static int
-cuse_server_ioctl(struct cdev *dev, unsigned long cmd,
-    caddr_t data, int fflag, struct thread *td)
+cuse_server_ioctl(struct dev_ioctl_args *ap)
 {
+	struct file *fp = ap->a_fp;
+	u_long cmd = ap->a_cmd;
+	caddr_t data = ap->a_data;
+
 	struct cuse_server *pcs;
 	int error;
 
-	error = cuse_server_get(&pcs);
+	error = cuse_server_get(fp, &pcs);
 	if (error != 0)
 		return (error);
 
@@ -1251,13 +1272,10 @@ cuse_server_ioctl(struct cdev *dev, unsigned long cmd,
 }
 
 static int
-#if (__FreeBSD_version >= 900000)
-cuse_server_mmap(struct cdev *dev, vm_ooffset_t offset, vm_paddr_t *paddr, int nprot, vm_memattr_t *memattr)
-#else
-cuse_server_mmap(struct cdev *dev, vm_offset_t offset, vm_paddr_t *paddr, int nprot)
-#endif
+cuse_server_mmap(struct dev_mmap_args *ap)
 {
-	uint32_t page_nr = offset / PAGE_SIZE;
+	struct file *fp = ap->a_fp;
+	uint32_t page_nr = ap->a_offset / PAGE_SIZE;
 	uint32_t alloc_nr = page_nr / CUSE_ALLOC_PAGES_MAX;
 	struct cuse_memory *mem;
 	struct cuse_server *pcs;
@@ -1267,7 +1285,7 @@ cuse_server_mmap(struct cdev *dev, vm_offset_t offset, vm_paddr_t *paddr, int np
 	if (alloc_nr >= CUSE_ALLOC_UNIT_MAX)
 		return (ENOMEM);
 
-	error = cuse_server_get(&pcs);
+	error = cuse_server_get(fp, &pcs);
 	if (error != 0)
 		pcs = NULL;
 
@@ -1296,7 +1314,7 @@ cuse_server_mmap(struct cdev *dev, vm_offset_t offset, vm_paddr_t *paddr, int np
 	ptr = mem->virtaddr + (page_nr * PAGE_SIZE);
 	cuse_unlock();
 
-	*paddr = vtophys(ptr);
+	ap->a_result = vtophys(ptr); // XXX: atop(...) ?
 
 	return (0);
 }
@@ -1334,8 +1352,11 @@ cuse_client_free(void *arg)
 }
 
 static int
-cuse_client_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
+cuse_client_open(struct dev_open_args *ap)
 {
+	struct file *fp = ap->a_fp;
+	cdev_t dev = ap->a_head.a_dev;
+
 	struct cuse_client_command *pccmd;
 	struct cuse_server_dev *pcsd;
 	struct cuse_client *pcc;
@@ -1370,14 +1391,14 @@ cuse_client_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
 		cuse_server_free(pcs);
 		return (ENOMEM);
 	}
-	if (devfs_set_cdevpriv(pcc, &cuse_client_free)) {
+	if (devfs_set_cdevpriv(fp, pcc, &cuse_client_free)) {
 		kprintf("Cuse4BSD: Cannot set cdevpriv.\n");
 		/* drop reference on server */
 		cuse_server_free(pcs);
 		kfree(pcc, M_CUSE4BSD);
 		return (ENOMEM);
 	}
-	pcc->fflags = fflags;
+	pcc->fflags = ap->a_oflags;
 	pcc->server_dev = pcsd;
 	pcc->server = pcs;
 
@@ -1409,7 +1430,7 @@ cuse_client_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
 	cuse_unlock();
 
 	if (error) {
-		devfs_clear_cdevpriv();	/* XXX bugfix */
+		devfs_clear_cdevpriv(fp);	/* XXX bugfix */
 		return (error);
 	}
 	pccmd = &pcc->cmds[CUSE_CMD_OPEN];
@@ -1431,19 +1452,20 @@ cuse_client_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
 	cuse_cmd_unlock(pccmd);
 
 	if (error)
-		devfs_clear_cdevpriv();	/* XXX bugfix */
+		devfs_clear_cdevpriv(fp);	/* XXX bugfix */
 
 	return (error);
 }
 
 static int
-cuse_client_close(struct cdev *dev, int fflag, int devtype, struct thread *td)
+cuse_client_close(struct dev_close_args *ap)
 {
+	struct file *fp = ap->a_fp;
 	struct cuse_client_command *pccmd;
 	struct cuse_client *pcc;
 	int error;
 
-	error = cuse_client_get(&pcc);
+	error = cuse_client_get(fp, &pcc);
 	if (error != 0)
 		return (0);
 
@@ -1480,7 +1502,9 @@ cuse_client_kqfilter_poll(struct cdev *dev, struct cuse_client *pcc)
 
 	if (temp != 0) {
 		/* get the latest polling state from the server */
+#if TODO
 		temp = cuse_client_poll(dev, POLLIN | POLLOUT, NULL);
+#endif
 
 		cuse_lock();
 		if (temp & (POLLIN | POLLOUT)) {
@@ -1497,14 +1521,19 @@ cuse_client_kqfilter_poll(struct cdev *dev, struct cuse_client *pcc)
 }
 
 static int
-cuse_client_read(struct cdev *dev, struct uio *uio, int ioflag)
+cuse_client_read(struct dev_read_args *ap)
 {
+	cdev_t dev = ap->a_head.a_dev;
+	struct file *fp = ap->a_fp;
+	struct uio *uio = ap->a_uio;
+	int ioflag = ap->a_ioflag;
+
 	struct cuse_client_command *pccmd;
 	struct cuse_client *pcc;
 	int error;
 	int len;
 
-	error = cuse_client_get(&pcc);
+	error = cuse_client_get(fp, &pcc);
 	if (error != 0)
 		return (error);
 
@@ -1557,14 +1586,19 @@ cuse_client_read(struct cdev *dev, struct uio *uio, int ioflag)
 }
 
 static int
-cuse_client_write(struct cdev *dev, struct uio *uio, int ioflag)
+cuse_client_write(struct dev_write_args *ap)
 {
+	cdev_t dev = ap->a_head.a_dev;
+	struct file *fp = ap->a_fp;
+	struct uio *uio = ap->a_uio;
+	int ioflag = ap->a_ioflag;
+
 	struct cuse_client_command *pccmd;
 	struct cuse_client *pcc;
 	int error;
 	int len;
 
-	error = cuse_client_get(&pcc);
+	error = cuse_client_get(fp, &pcc);
 	if (error != 0)
 		return (error);
 
@@ -1617,15 +1651,20 @@ cuse_client_write(struct cdev *dev, struct uio *uio, int ioflag)
 }
 
 int
-cuse_client_ioctl(struct cdev *dev, unsigned long cmd,
-    caddr_t data, int fflag, struct thread *td)
+cuse_client_ioctl(struct dev_ioctl_args *ap)
 {
+	struct file *fp = ap->a_fp;
+	cdev_t dev = ap->a_head.a_dev;
+	u_long cmd = ap->a_cmd;
+	caddr_t data = ap->a_data;
+	int fflag = ap->a_fflag;
+
 	struct cuse_client_command *pccmd;
 	struct cuse_client *pcc;
 	int error;
 	int len;
 
-	error = cuse_client_get(&pcc);
+	error = cuse_client_get(fp, &pcc);
 	if (error != 0)
 		return (error);
 
@@ -1672,6 +1711,7 @@ cuse_client_ioctl(struct cdev *dev, unsigned long cmd,
 	return (error);
 }
 
+#ifdef TODO
 static int
 cuse_client_poll(struct cdev *dev, int events, struct thread *td)
 {
@@ -1681,7 +1721,7 @@ cuse_client_poll(struct cdev *dev, int events, struct thread *td)
 	int error;
 	int revents;
 
-	error = cuse_client_get(&pcc);
+	error = cuse_client_get(fp, &pcc);
 	if (error != 0)
 		return (POLLNVAL);
 
@@ -1727,15 +1767,13 @@ cuse_client_poll(struct cdev *dev, int events, struct thread *td)
 
 	return (revents);
 }
+#endif
 
 static int
-#if (__FreeBSD_version >= 900000)
-cuse_client_mmap(struct cdev *dev, vm_ooffset_t offset, vm_paddr_t *paddr, int nprot, vm_memattr_t *memattr)
-#else
-cuse_client_mmap(struct cdev *dev, vm_offset_t offset, vm_paddr_t *paddr, int nprot)
-#endif
+cuse_client_mmap(struct dev_mmap_args *ap)
 {
-	uint32_t page_nr = offset / PAGE_SIZE;
+	struct file *fp = ap->a_fp;
+	uint32_t page_nr = ap->a_offset / PAGE_SIZE;
 	uint32_t alloc_nr = page_nr / CUSE_ALLOC_PAGES_MAX;
 	struct cuse_memory *mem;
 	struct cuse_server *pcs;
@@ -1746,7 +1784,7 @@ cuse_client_mmap(struct cdev *dev, vm_offset_t offset, vm_paddr_t *paddr, int np
 	if (alloc_nr >= CUSE_ALLOC_UNIT_MAX)
 		return (ENOMEM);
 
-	error = cuse_client_get(&pcc);
+	error = cuse_client_get(fp, &pcc);
 	if (error != 0)
 		pcs = NULL;
 	else
@@ -1777,7 +1815,7 @@ cuse_client_mmap(struct cdev *dev, vm_offset_t offset, vm_paddr_t *paddr, int np
 	ptr = mem->virtaddr + (page_nr * PAGE_SIZE);
 	cuse_unlock();
 
-	*paddr = vtophys(ptr);
+	ap->a_result = vtophys(ptr); // XXX: atop(...) ?
 
 	return (0);
 }
@@ -1788,8 +1826,10 @@ cuse_client_kqfilter_read_detach(struct knote *kn)
 	struct cuse_client *pcc;
 
 	cuse_lock();
-	pcc = kn->kn_hook;
+	pcc = (struct cuse_client *)kn->kn_hook;
+#ifdef TODO
 	knlist_remove(&pcc->server->selinfo.ki_note, kn, 1);
+#endif
 	cuse_unlock();
 }
 
@@ -1799,8 +1839,10 @@ cuse_client_kqfilter_write_detach(struct knote *kn)
 	struct cuse_client *pcc;
 
 	cuse_lock();
-	pcc = kn->kn_hook;
+	pcc = (struct cuse_client *)kn->kn_hook;
+#ifdef TODO
 	knlist_remove(&pcc->server->selinfo.ki_note, kn, 1);
+#endif
 	cuse_unlock();
 }
 
@@ -1811,7 +1853,7 @@ cuse_client_kqfilter_read_event(struct knote *kn, long hint)
 
 	KKASSERT(lockstatus(&cuse_lk, curthread) != 0);
 
-	pcc = kn->kn_hook;
+	pcc = (struct cuse_client *)kn->kn_hook;
 	return ((pcc->cflags & CUSE_CLI_KNOTE_NEED_READ) ? 1 : 0);
 }
 
@@ -1822,18 +1864,21 @@ cuse_client_kqfilter_write_event(struct knote *kn, long hint)
 
 	KKASSERT(lockstatus(&cuse_lk, curthread) != 0);
 
-	pcc = kn->kn_hook;
+	pcc = (struct cuse_client *)kn->kn_hook;
 	return ((pcc->cflags & CUSE_CLI_KNOTE_NEED_WRITE) ? 1 : 0);
 }
 
 static int
-cuse_client_kqfilter(struct cdev *dev, struct knote *kn)
+cuse_client_kqfilter(struct dev_kqfilter_args *ap)
 {
+	struct file *fp = ap->a_fp;
+	struct knote *kn = ap->a_kn;
+
 	struct cuse_client *pcc;
 	struct cuse_server *pcs;
 	int error;
 
-	error = cuse_client_get(&pcc);
+	error = cuse_client_get(fp, &pcc);
 	if (error != 0)
 		return (error);
 
@@ -1842,15 +1887,19 @@ cuse_client_kqfilter(struct cdev *dev, struct knote *kn)
 	switch (kn->kn_filter) {
 	case EVFILT_READ:
 		pcc->cflags |= CUSE_CLI_KNOTE_HAS_READ;
-		kn->kn_hook = pcc;
+		kn->kn_hook = (void *)pcc;
 		kn->kn_fop = &cuse_client_kqfilter_read_ops;
+#ifdef TODO
 		knlist_add(&pcs->selinfo.ki_note, kn, 1);
+#endif
 		break;
 	case EVFILT_WRITE:
 		pcc->cflags |= CUSE_CLI_KNOTE_HAS_WRITE;
-		kn->kn_hook = pcc;
+		kn->kn_hook = (void *)pcc;
 		kn->kn_fop = &cuse_client_kqfilter_write_ops;
+#ifdef TODO
 		knlist_add(&pcs->selinfo.ki_note, kn, 1);
+#endif
 		break;
 	default:
 		error = EINVAL;
@@ -1858,7 +1907,9 @@ cuse_client_kqfilter(struct cdev *dev, struct knote *kn)
 	}
 	cuse_unlock();
 
+#ifdef TODO
 	if (error == 0)
 		cuse_client_kqfilter_poll(dev, pcc);
+#endif
 	return (error);
 }
