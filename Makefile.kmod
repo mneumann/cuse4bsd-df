@@ -26,6 +26,6 @@
 .PATH: ${.CURDIR}
 
 KMOD=	cuse4bsd
-SRCS=	cuse4bsd_kmod.c device_if.h bus_if.h vnode_if.h opt_compat.h
+SRCS=	cuse4bsd_kmod.c device_if.h bus_if.h opt_compat.h
 
 .include <bsd.kmod.mk>

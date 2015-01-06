@@ -26,7 +26,6 @@
 #include "opt_compat.h"
 
 #include <sys/stdint.h>
-#include <sys/stddef.h>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/systm.h>
@@ -36,7 +35,6 @@
 #include <sys/linker_set.h>
 #include <sys/module.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/condvar.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
@@ -44,18 +42,19 @@
 #include <sys/priv.h>
 #include <sys/uio.h>
 #include <sys/poll.h>
-#include <sys/sx.h>
+#include <sys/lock.h>
 #include <sys/queue.h>
 #include <sys/fcntl.h>
 #include <sys/proc.h>
 #include <sys/vnode.h>
-#include <sys/selinfo.h>
 #include <sys/ptrace.h>
 
-#include <machine/bus.h>
+#include <sys/bus.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+
+#include <sys/devfs.h>
 
 #define	HAVE_CUSE_IOCTL
 
@@ -76,7 +75,7 @@ struct cuse_client;
 struct cuse_client_command {
 	TAILQ_ENTRY(cuse_client_command) entry;
 	struct cuse_command sub;
-	struct sx sx;
+	struct lock lk;
 	struct cv cv;
 	struct thread *entered;
 	struct cuse_client *client;
@@ -107,7 +106,7 @@ struct cuse_server {
 	TAILQ_HEAD(, cuse_server_dev) hdev;
 	TAILQ_HEAD(, cuse_client) hcli;
 	struct cv cv;
-	struct selinfo selinfo;
+	struct kqinfo selinfo;
 	int	is_closing;
 	int	refs;
 };
@@ -136,7 +135,7 @@ struct cuse_client {
 static	MALLOC_DEFINE(M_CUSE4BSD, "cuse", "Cuse4BSD memory");
 
 static TAILQ_HEAD(, cuse_server) cuse_server_head;
-static struct mtx cuse_mtx;
+static struct lock cuse_lk;
 static struct cdev *cuse_dev;
 static struct cuse_server *cuse_alloc_unit[CUSE_DEVICES_MAX];
 static int cuse_alloc_unit_id[CUSE_DEVICES_MAX];
@@ -148,15 +147,17 @@ static int cuse_client_kqfilter_read_event(struct knote *kn, long hint);
 static int cuse_client_kqfilter_write_event(struct knote *kn, long hint);
 
 static struct filterops cuse_client_kqfilter_read_ops = {
-	.f_isfd = 1,
-	.f_detach = cuse_client_kqfilter_read_detach,
-	.f_event = cuse_client_kqfilter_read_event,
+	FILTEROP_ISFD | FILTEROP_MPSAFE /* XXX */,
+	NULL,
+	cuse_client_kqfilter_read_detach,
+	cuse_client_kqfilter_read_event,
 };
 
 static struct filterops cuse_client_kqfilter_write_ops = {
-	.f_isfd = 1,
-	.f_detach = cuse_client_kqfilter_write_detach,
-	.f_event = cuse_client_kqfilter_write_event,
+	FILTEROP_ISFD | FILTEROP_MPSAFE /* XXX */,
+	NULL,
+	cuse_client_kqfilter_write_detach,
+	cuse_client_kqfilter_write_event,
 };
 
 static d_open_t cuse_client_open;
@@ -164,20 +165,16 @@ static d_close_t cuse_client_close;
 static d_ioctl_t cuse_client_ioctl;
 static d_read_t cuse_client_read;
 static d_write_t cuse_client_write;
-static d_poll_t cuse_client_poll;
 static d_mmap_t cuse_client_mmap;
 static d_kqfilter_t cuse_client_kqfilter;
 
-static struct cdevsw cuse_client_devsw = {
-	.d_version = D_VERSION,
+static struct dev_ops cuse_client_devsw = {
+	{ "cuse_client", 0, D_TRACKCLOSE | D_MPSAFE /* XXX */ },
 	.d_open = cuse_client_open,
 	.d_close = cuse_client_close,
 	.d_ioctl = cuse_client_ioctl,
-	.d_name = "cuse_client",
-	.d_flags = D_TRACKCLOSE,
 	.d_read = cuse_client_read,
 	.d_write = cuse_client_write,
-	.d_poll = cuse_client_poll,
 	.d_mmap = cuse_client_mmap,
 	.d_kqfilter = cuse_client_kqfilter,
 };
@@ -187,19 +184,15 @@ static d_close_t cuse_server_close;
 static d_ioctl_t cuse_server_ioctl;
 static d_read_t cuse_server_read;
 static d_write_t cuse_server_write;
-static d_poll_t cuse_server_poll;
 static d_mmap_t cuse_server_mmap;
 
-static struct cdevsw cuse_server_devsw = {
-	.d_version = D_VERSION,
+static struct dev_ops cuse_server_devsw = {
+	{ "cuse_server", 0, D_TRACKCLOSE | D_MPSAFE /* XXX */ },
 	.d_open = cuse_server_open,
 	.d_close = cuse_server_close,
 	.d_ioctl = cuse_server_ioctl,
-	.d_name = "cuse_server",
-	.d_flags = D_TRACKCLOSE,
 	.d_read = cuse_server_read,
 	.d_write = cuse_server_write,
-	.d_poll = cuse_server_poll,
 	.d_mmap = cuse_server_mmap,
 };
 
@@ -209,25 +202,25 @@ static int cuse_free_unit_by_id_locked(struct cuse_server *, int);
 static void
 cuse_lock(void)
 {
-	mtx_lock(&cuse_mtx);
+	lockmgr(&cuse_lk, LK_EXCLUSIVE);
 }
 
 static void
 cuse_unlock(void)
 {
-	mtx_unlock(&cuse_mtx);
+	lockmgr(&cuse_lk, LK_RELEASE);
 }
 
 static void
 cuse_cmd_lock(struct cuse_client_command *pccmd)
 {
-	sx_xlock(&pccmd->sx);
+	lockmgr(&pccmd->lk, LK_EXCLUSIVE);
 }
 
 static void
 cuse_cmd_unlock(struct cuse_client_command *pccmd)
 {
-	sx_xunlock(&pccmd->sx);
+	lockmgr(&pccmd->lk, LK_RELEASE); 
 }
 
 static void
@@ -235,17 +228,17 @@ cuse_kern_init(void *arg)
 {
 	TAILQ_INIT(&cuse_server_head);
 
-	mtx_init(&cuse_mtx, "cuse-mtx", NULL, MTX_DEF);
+	lockinit(&cuse_lk, "cuse-lock", 0, LK_CANRECURSE);
 
 	cuse_dev = make_dev(&cuse_server_devsw, 0,
 	    UID_ROOT, GID_OPERATOR, 0600, "cuse");
 
-	printf("Cuse4BSD v%d.%d.%d @ /dev/cuse\n",
+	kprintf("Cuse4BSD v%d.%d.%d @ /dev/cuse\n",
 	    (CUSE_VERSION >> 16) & 0xFF, (CUSE_VERSION >> 8) & 0xFF,
 	    (CUSE_VERSION >> 0) & 0xFF);
 }
 
-SYSINIT(cuse_kern_init, SI_SUB_DEVFS, SI_ORDER_ANY, cuse_kern_init, 0);
+SYSINIT(cuse_kern_init, SI_SUB_VFS /* XXX */, SI_ORDER_ANY, cuse_kern_init, 0);
 
 static void
 cuse_kern_uninit(void *arg)
@@ -254,10 +247,10 @@ cuse_kern_uninit(void *arg)
 
 	while (1) {
 
-		printf("Cuse4BSD: Please exit all /dev/cuse instances "
+		kprintf("Cuse4BSD: Please exit all /dev/cuse instances "
 		    "and processes which have used this device.\n");
 
-		pause("DRAIN", 2 * hz);
+		tsleep(&ptr, 0, "DRAIN", 2 * hz);
 
 		cuse_lock();
 		ptr = TAILQ_FIRST(&cuse_server_head);
@@ -270,10 +263,10 @@ cuse_kern_uninit(void *arg)
 	if (cuse_dev != NULL)
 		destroy_dev(cuse_dev);
 
-	mtx_destroy(&cuse_mtx);
+	lockuninit(&cuse_lk);
 }
 
-SYSUNINIT(cuse_kern_uninit, SI_SUB_DEVFS, SI_ORDER_ANY, cuse_kern_uninit, 0);
+SYSUNINIT(cuse_kern_uninit, SI_SUB_VFS /* XXX */, SI_ORDER_ANY, cuse_kern_uninit, 0);
 
 static int
 cuse_server_get(struct cuse_server **ppcs)
@@ -437,7 +430,7 @@ cuse_server_alloc_memory(struct cuse_server *pcs,
 
 	cuse_unlock();
 
-	ptr = malloc(page_count * PAGE_SIZE, M_CUSE4BSD, M_WAITOK | M_ZERO);
+	ptr = kmalloc(page_count * PAGE_SIZE, M_CUSE4BSD, M_WAITOK | M_ZERO);
 	if (ptr == NULL)
 		error = ENOMEM;
 	else
@@ -573,9 +566,9 @@ cuse_client_receive_command_locked(struct cuse_client_command *pccmd,
 	}
 	while (pccmd->command == CUSE_CMD_NONE) {
 		if (error != 0) {
-			cv_wait(&pccmd->cv, &cuse_mtx);
+			cv_wait(&pccmd->cv, &cuse_lk);
 		} else {
-			error = cv_wait_sig(&pccmd->cv, &cuse_mtx);
+			error = cv_wait_sig(&pccmd->cv, &cuse_lk);
 
 			if (error != 0)
 				cuse_client_got_signal(pccmd);
@@ -598,7 +591,7 @@ done:
 	pccmd->proc_curr = NULL;
 
 	while (pccmd->proc_refs != 0)
-		cv_wait(&pccmd->cv, &cuse_mtx);
+		cv_wait(&pccmd->cv, &cuse_lk);
 
 	return (error);
 }
@@ -632,7 +625,7 @@ cuse_server_free_dev(struct cuse_server_dev *pcsd)
 		/* destroy device synchronously */
 		destroy_dev(pcsd->kern_dev);
 	}
-	free(pcsd, M_CUSE4BSD);
+	kfree(pcsd, M_CUSE4BSD);
 }
 
 static void
@@ -662,8 +655,8 @@ cuse_server_free(void *arg)
 
 	cuse_server_free_memory(pcs);
 
-	knlist_clear(&pcs->selinfo.si_note, 1);
-	knlist_destroy(&pcs->selinfo.si_note);
+	knlist_clear(&pcs->selinfo.ki_note, 1);
+	knlist_destroy(&pcs->selinfo.ki_note);
 
 	cuse_unlock();
 
@@ -671,7 +664,7 @@ cuse_server_free(void *arg)
 
 	cv_destroy(&pcs->cv);
 
-	free(pcs, M_CUSE4BSD);
+	kfree(pcs, M_CUSE4BSD);
 }
 
 static int
@@ -679,13 +672,13 @@ cuse_server_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
 {
 	struct cuse_server *pcs;
 
-	pcs = malloc(sizeof(*pcs), M_CUSE4BSD, M_WAITOK | M_ZERO);
+	pcs = kmalloc(sizeof(*pcs), M_CUSE4BSD, M_WAITOK | M_ZERO);
 	if (pcs == NULL)
 		return (ENOMEM);
 
 	if (devfs_set_cdevpriv(pcs, &cuse_server_free)) {
-		printf("Cuse4BSD: Cannot set cdevpriv.\n");
-		free(pcs, M_CUSE4BSD);
+		kprintf("Cuse4BSD: Cannot set cdevpriv.\n");
+		kfree(pcs, M_CUSE4BSD);
 		return (ENOMEM);
 	}
 	TAILQ_INIT(&pcs->head);
@@ -693,8 +686,6 @@ cuse_server_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
 	TAILQ_INIT(&pcs->hcli);
 
 	cv_init(&pcs->cv, "cuse-server-cv");
-
-	knlist_init_mtx(&pcs->selinfo.si_note, &cuse_mtx);
 
 	cuse_lock();
 	pcs->refs++;
@@ -716,7 +707,7 @@ cuse_server_close(struct cdev *dev, int fflag, int devtype, struct thread *td)
 
 	cuse_lock();
 	cuse_server_is_closing(pcs);
-	knlist_clear(&pcs->selinfo.si_note, 1);
+	knlist_clear(&pcs->selinfo.ki_note, 1);
 	cuse_unlock();
 
 done:
@@ -929,7 +920,7 @@ static void
 cuse_server_wakeup_locked(struct cuse_server *pcs)
 {
 	selwakeup(&pcs->selinfo);
-	KNOTE_LOCKED(&pcs->selinfo.si_note, 0);
+	KNOTE_LOCKED(&pcs->selinfo.ki_note, 0);
 }
 
 static int
@@ -978,7 +969,7 @@ cuse_server_ioctl(struct cdev *dev, unsigned long cmd,
 		cuse_lock();
 
 		while ((pccmd = TAILQ_FIRST(&pcs->head)) == NULL) {
-			error = cv_wait_sig(&pcs->cv, &cuse_mtx);
+			error = cv_wait_sig(&pcs->cv, &cuse_lk);
 
 			if (pcs->is_closing)
 				error = ENXIO;
@@ -1156,7 +1147,7 @@ cuse_server_ioctl(struct cdev *dev, unsigned long cmd,
 
 		/* try to allocate a character device */
 
-		pcsd = malloc(sizeof(*pcsd), M_CUSE4BSD, M_WAITOK | M_ZERO);
+		pcsd = kmalloc(sizeof(*pcsd), M_CUSE4BSD, M_WAITOK | M_ZERO);
 
 		if (pcsd == NULL) {
 			error = ENOMEM;
@@ -1177,7 +1168,7 @@ cuse_server_ioctl(struct cdev *dev, unsigned long cmd,
 #endif
 
 		if (pcsd->kern_dev == NULL) {
-			free(pcsd, M_CUSE4BSD);
+			kfree(pcsd, M_CUSE4BSD);
 			error = ENOMEM;
 			break;
 		}
@@ -1260,13 +1251,6 @@ cuse_server_ioctl(struct cdev *dev, unsigned long cmd,
 }
 
 static int
-cuse_server_poll(struct cdev *dev, int events, struct thread *td)
-{
-	return (events & (POLLHUP | POLLPRI | POLLIN |
-	    POLLRDNORM | POLLOUT | POLLWRNORM));
-}
-
-static int
 #if (__FreeBSD_version >= 900000)
 cuse_server_mmap(struct cdev *dev, vm_ooffset_t offset, vm_paddr_t *paddr, int nprot, vm_memattr_t *memattr)
 #else
@@ -1337,13 +1321,13 @@ cuse_client_free(void *arg)
 
 		pccmd = &pcc->cmds[n];
 
-		sx_destroy(&pccmd->sx);
+		lockuninit(&pccmd->lk);
 		cv_destroy(&pccmd->cv);
 	}
 
 	pcs = pcc->server;
 
-	free(pcc, M_CUSE4BSD);
+	kfree(pcc, M_CUSE4BSD);
 
 	/* drop reference on server */
 	cuse_server_free(pcs);
@@ -1380,17 +1364,17 @@ cuse_client_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
 	if (pcsd == NULL)
 		return (EINVAL);
 
-	pcc = malloc(sizeof(*pcc), M_CUSE4BSD, M_WAITOK | M_ZERO);
+	pcc = kmalloc(sizeof(*pcc), M_CUSE4BSD, M_WAITOK | M_ZERO);
 	if (pcc == NULL) {
 		/* drop reference on server */
 		cuse_server_free(pcs);
 		return (ENOMEM);
 	}
 	if (devfs_set_cdevpriv(pcc, &cuse_client_free)) {
-		printf("Cuse4BSD: Cannot set cdevpriv.\n");
+		kprintf("Cuse4BSD: Cannot set cdevpriv.\n");
 		/* drop reference on server */
 		cuse_server_free(pcs);
-		free(pcc, M_CUSE4BSD);
+		kfree(pcc, M_CUSE4BSD);
 		return (ENOMEM);
 	}
 	pcc->fflags = fflags;
@@ -1405,7 +1389,7 @@ cuse_client_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
 		pccmd->sub.command = n;
 		pccmd->client = pcc;
 
-		sx_init(&pccmd->sx, "cuse-client-sx");
+		lockinit(&pccmd->lk, "cuse-client-sx", 0, LK_CANRECURSE);
 		cv_init(&pccmd->cv, "cuse-client-cv");
 	}
 
@@ -1805,7 +1789,7 @@ cuse_client_kqfilter_read_detach(struct knote *kn)
 
 	cuse_lock();
 	pcc = kn->kn_hook;
-	knlist_remove(&pcc->server->selinfo.si_note, kn, 1);
+	knlist_remove(&pcc->server->selinfo.ki_note, kn, 1);
 	cuse_unlock();
 }
 
@@ -1816,7 +1800,7 @@ cuse_client_kqfilter_write_detach(struct knote *kn)
 
 	cuse_lock();
 	pcc = kn->kn_hook;
-	knlist_remove(&pcc->server->selinfo.si_note, kn, 1);
+	knlist_remove(&pcc->server->selinfo.ki_note, kn, 1);
 	cuse_unlock();
 }
 
@@ -1825,7 +1809,7 @@ cuse_client_kqfilter_read_event(struct knote *kn, long hint)
 {
 	struct cuse_client *pcc;
 
-	mtx_assert(&cuse_mtx, MA_OWNED);
+	KKASSERT(lockstatus(&cuse_lk, curthread) != 0);
 
 	pcc = kn->kn_hook;
 	return ((pcc->cflags & CUSE_CLI_KNOTE_NEED_READ) ? 1 : 0);
@@ -1836,7 +1820,7 @@ cuse_client_kqfilter_write_event(struct knote *kn, long hint)
 {
 	struct cuse_client *pcc;
 
-	mtx_assert(&cuse_mtx, MA_OWNED);
+	KKASSERT(lockstatus(&cuse_lk, curthread) != 0);
 
 	pcc = kn->kn_hook;
 	return ((pcc->cflags & CUSE_CLI_KNOTE_NEED_WRITE) ? 1 : 0);
@@ -1860,13 +1844,13 @@ cuse_client_kqfilter(struct cdev *dev, struct knote *kn)
 		pcc->cflags |= CUSE_CLI_KNOTE_HAS_READ;
 		kn->kn_hook = pcc;
 		kn->kn_fop = &cuse_client_kqfilter_read_ops;
-		knlist_add(&pcs->selinfo.si_note, kn, 1);
+		knlist_add(&pcs->selinfo.ki_note, kn, 1);
 		break;
 	case EVFILT_WRITE:
 		pcc->cflags |= CUSE_CLI_KNOTE_HAS_WRITE;
 		kn->kn_hook = pcc;
 		kn->kn_fop = &cuse_client_kqfilter_write_ops;
-		knlist_add(&pcs->selinfo.si_note, kn, 1);
+		knlist_add(&pcs->selinfo.ki_note, kn, 1);
 		break;
 	default:
 		error = EINVAL;
